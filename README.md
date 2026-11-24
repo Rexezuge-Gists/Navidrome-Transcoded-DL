@@ -92,6 +92,15 @@ export ND_PASSWORD='your-password'      # or: read -rs ND_PASSWORD
 ./navidrome_favsync.py --out ~/Music
 ```
 
+Not sure whether it's the URL, the credentials, or the server? Check just the
+connection — it writes nothing and exits after one ping:
+
+```bash
+ND_URL=https://navi.550441.xyz ND_USERNAME=test ND_PASSWORD='your-password' \
+  ./navidrome_favsync.py --check
+# Connection OK: Navidrome 0.64.2, Subsonic API 1.16.1 at https://navi.550441.xyz
+```
+
 A scheduled sync, e.g. nightly at 4am:
 
 ```cron
@@ -276,7 +285,7 @@ Use `--no-embed` to keep `cover.jpg` but leave the `.opus` files alone, or
 | `--bitrate` | `192` | Target bitrate in kbps, 6–256 |
 | `--workers N` | `1` | Parallel downloads. Each spawns an ffmpeg transcode **on the server** |
 | `--retries N` | `5` | Attempts per track, not per request |
-
+| `--check` | off | Only verify the connection and print the server version, then exit |
 | `--timeout` | `60` | Socket timeout in seconds |
 | `--cover-size` | `1000` | Cover art edge size in pixels |
 | `--no-cover` | off | Don't fetch or save artwork |

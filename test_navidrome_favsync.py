@@ -2195,6 +2195,71 @@ class TestAuth(EndToEndTestCase):
         self.assertEqual(code, 0)
 
 
+class TestConnectionCheck(EndToEndTestCase):
+    library = (("ok-1", "First Track", 1),)
+
+    def check_args(self, out, password=PASSWORD):
+        return [
+            "--url", self.server.url,
+            "--user", USERNAME,
+            "--password", password,
+            "--out", str(out),
+            "--log-level", "CRITICAL",
+            "--check",
+        ]
+
+    def test_check_only_pings_and_writes_nothing(self):
+        out = self.temp_dir()
+        code = navi.main(self.check_args(out))
+        self.assertEqual(code, 0)
+        self.assertEqual(list(out.iterdir()), [])
+        self.assertEqual([endpoint for endpoint, _ in self.server.state["requests"]], ["ping"])
+
+    def test_check_reports_bad_credentials(self):
+        out = self.temp_dir()
+        code = navi.main(self.check_args(out, password="wrong"))
+        self.assertEqual(code, 2)
+        self.assertGreaterEqual(self.server.state["auth_failures"], 1)
+        self.assertEqual(list(out.iterdir()), [])
+
+    def test_check_retries_transient_ping_failure(self):
+        out = self.temp_dir()
+        ping = mock.Mock(side_effect=[
+            navi.SubsonicError("ping failed: HTTP 503", http_status=503),
+            {"status": "ok", "version": "1.16.1", "serverVersion": "0.99.0"},
+        ])
+        with mock.patch.object(navi.NavidromeClient, "ping", ping), mock.patch.object(navi.time, "sleep") as sleep:
+            code = navi.main(self.check_args(out))
+        self.assertEqual(code, 0)
+        self.assertEqual(ping.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_check_does_not_retry_bad_credentials(self):
+        out = self.temp_dir()
+        ping = mock.Mock(side_effect=navi.SubsonicError(
+            "ping failed: Wrong username or password", code=40, http_status=200
+        ))
+        with mock.patch.object(navi.NavidromeClient, "ping", ping), mock.patch.object(navi.time, "sleep") as sleep:
+            code = navi.main(self.check_args(out))
+        self.assertEqual(code, 2)
+        ping.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_check_caps_retries(self):
+        out = self.temp_dir()
+        ping = mock.Mock(side_effect=navi.SubsonicError("ping failed: reset", retryable=True))
+        with mock.patch.object(navi.NavidromeClient, "ping", ping), mock.patch.object(navi.time, "sleep"):
+            code = navi.main(self.check_args(out))
+        self.assertEqual(code, 2)
+        self.assertEqual(ping.call_count, navi.MAX_PING_ATTEMPTS)
+
+    def test_check_rejects_a_scope(self):
+        args = navi.build_parser().parse_args(
+            ["--url", "http://x", "--user", "a", "--password", "b", "--check", "--favorites-only"]
+        )
+        self.assertTrue(any("--check cannot be combined" in problem for problem in navi.validate_args(args)))
+
+
 class TestArgumentValidation(unittest.TestCase):
     def test_missing_required(self):
         self.assertEqual(navi.main(["--log-level", "CRITICAL"]), 2)

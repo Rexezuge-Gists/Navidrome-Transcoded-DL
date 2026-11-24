@@ -19,7 +19,9 @@ and then lets you choose from the hits.
 Navidrome only exposes transcoded audio through the Subsonic API (``/rest``), so
 this script speaks that protocol end to end:
 
-  * ``ping``          - validate the URL and credentials before doing any work
+  * ``ping``          - validate the URL and credentials before doing any work;
+                        transient failures are retried, and ``--check`` runs
+                        only this step
   * ``getAlbumList2`` - page through every album (``alphabeticalByName``)
   * ``getAlbum``      - the tracks of one album
   * ``getStarred2``   - the account's favorite tracks (``--favorites-only``)
@@ -134,6 +136,10 @@ TRANSCODER_FAULT_MARKERS = (
 
 DEFAULT_BACKOFF_BASE = 1.0
 DEFAULT_BACKOFF_CAP = 30.0
+# A startup ping is retried too, but it should not turn a dead server into a
+# long wait: three tries and short caps are enough for a transient hiccup.
+MAX_PING_ATTEMPTS = 3
+PING_BACKOFF_CAP = 2.0
 
 # Enough bytes for the first Ogg page's fixed header plus a maximal 255-entry
 # segment table and an eight-byte codec tag (27 + 255 + 8).
@@ -187,6 +193,64 @@ class OggError(NavifavError):
 class SelectionError(NavifavError):
     """A selection could not be made: conflicting flags, song ids the server does
     not know, or a ``--pick`` with no terminal to ask the question on."""
+
+
+def backoff(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Wait time before the next attempt, with jitter and an upper bound."""
+    if retry_after is not None:
+        return min(retry_after, DEFAULT_BACKOFF_CAP)
+    window = min(DEFAULT_BACKOFF_CAP, DEFAULT_BACKOFF_BASE * (2**attempt))
+    return random.uniform(0, window)  # noqa: S311 - jitter, not cryptography
+
+
+def is_retryable(error: Exception) -> tuple:
+    """Decide whether *error* is worth another attempt, and how long to wait."""
+    if isinstance(error, NotTranscodedError):
+        # A server misconfiguration; retrying cannot change the answer.
+        return False, None
+    if isinstance(error, SubsonicError):
+        if error.retryable is not None:
+            return error.retryable, error.retry_after
+        if error.http_status == 401:
+            return False, None
+        if error.http_status is not None:
+            return (error.http_status in RETRYABLE_HTTP_STATUS, error.retry_after)
+        if error.code is not None:
+            return (error.code in RETRYABLE_SUBSONIC_CODES, error.retry_after)
+        # Neither an HTTP status nor a Subsonic code: a transport-level
+        # problem, which is exactly what retrying helps with.
+        return True, error.retry_after
+    if isinstance(error, (OSError, http.client.HTTPException)):
+        return True, None
+    return False, None
+
+
+def ping_with_retry(client: NavidromeClient, attempts: int) -> dict:
+    """Ping the server, giving transient failures the same chance as downloads.
+
+    Authentication and other permanent errors are raised immediately; connection
+    resets, timeouts, 429s and 5xx responses get a short, capped retry.
+    """
+    attempts = min(max(1, attempts), MAX_PING_ATTEMPTS)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.ping()
+        except (SubsonicError, OSError, http.client.HTTPException) as exc:
+            last_error = exc
+            retry, retry_after = is_retryable(exc)
+            if not retry or attempt >= attempts:
+                raise
+            delay = min(backoff(attempt - 1, retry_after), PING_BACKOFF_CAP)
+            LOG.warning(
+                "Connection attempt %d/%d failed: %s (retrying in %.1fs)",
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    raise last_error  # pragma: no cover - the loop always returns or raises
 
 
 # ---------------------------------------------------------------------------
@@ -1704,33 +1768,6 @@ class FavSyncer:
         with self._stats_lock:
             self.stats[key] += 1
 
-    def _backoff(self, attempt: int, retry_after: Optional[float] = None) -> float:
-        if retry_after is not None:
-            return min(retry_after, DEFAULT_BACKOFF_CAP)
-        window = min(DEFAULT_BACKOFF_CAP, DEFAULT_BACKOFF_BASE * (2**attempt))
-        return random.uniform(0, window)  # noqa: S311 - jitter, not cryptography
-
-    def _is_retryable(self, error: Exception) -> tuple:
-        """Decide whether *error* is worth another attempt, and how long to wait."""
-        if isinstance(error, NotTranscodedError):
-            # A server misconfiguration; retrying cannot change the answer.
-            return False, None
-        if isinstance(error, SubsonicError):
-            if error.retryable is not None:
-                return error.retryable, error.retry_after
-            if error.http_status == 401:
-                return False, None
-            if error.http_status is not None:
-                return (error.http_status in RETRYABLE_HTTP_STATUS, error.retry_after)
-            if error.code is not None:
-                return (error.code in RETRYABLE_SUBSONIC_CODES, error.retry_after)
-            # Neither an HTTP status nor a Subsonic code: a transport-level
-            # problem, which is exactly what retrying helps with.
-            return True, error.retry_after
-        if isinstance(error, (OSError, http.client.HTTPException)):
-            return True, None
-        return False, None
-
     @staticmethod
     def _is_transcoder_fault(error: Exception) -> bool:
         text = str(error).lower()
@@ -1960,12 +1997,12 @@ class FavSyncer:
             except (SubsonicError, NotTranscodedError, OggError, OSError, http.client.HTTPException) as exc:
                 part_path.unlink(missing_ok=True)
                 result.error = str(exc)
-                retryable, retry_after = self._is_retryable(exc)
+                retryable, retry_after = is_retryable(exc)
                 if not retryable or attempt >= self.args.retries:
                     if self._is_transcoder_fault(exc):
                         transcoder_fault = True
                     break
-                delay = self._backoff(attempt - 1, retry_after)
+                delay = backoff(attempt - 1, retry_after)
                 LOG.warning(
                     "Attempt %d/%d failed for %s: %s (retrying in %.1fs)",
                     attempt,
@@ -2171,6 +2208,8 @@ configuration, otherwise it will stream the original files unchanged.
     parser.add_argument("--limit", type=int, default=0,
                         help="only process the first N tracks found (0 = all); stops the library scan early")
     parser.add_argument("--dry-run", action="store_true", help="list what would be downloaded and exit")
+    parser.add_argument("--check", action="store_true",
+                        help="only verify the connection and print the server version, then exit")
     parser.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
     parser.add_argument("--manifest-name", default="manifest.jsonl", help="manifest filename inside --out")
     parser.add_argument("--log-file", help="also write logs to this file")
@@ -2200,6 +2239,11 @@ def validate_args(args: argparse.Namespace) -> list:
         problems.append("--user is required (or set ND_USERNAME)")
     if args.password is None:
         problems.append("--password is required (or set ND_PASSWORD)")
+    if args.check and (
+        args.favorites_only or args.song_id or args.search is not None
+        or args.artist is not None or args.album is not None or args.pick or args.all
+    ):
+        problems.append("--check cannot be combined with a download scope or selection flag")
     problems.extend(validate_scope_args(args))
     if not MIN_OPUS_BITRATE <= args.bitrate <= MAX_OPUS_BITRATE:
         problems.append(f"--bitrate must be between {MIN_OPUS_BITRATE} and {MAX_OPUS_BITRATE} kbps")
@@ -2268,6 +2312,30 @@ def main(argv: Optional[list] = None) -> int:
     if args.url and "://" not in args.url:
         args.url = f"https://{args.url}"
 
+    client = NavidromeClient(args.url, args.user, args.password, timeout=args.timeout, insecure=args.insecure)
+
+    try:
+        response = ping_with_retry(client, args.retries)
+    except (SubsonicError, OSError, http.client.HTTPException) as exc:
+        if isinstance(exc, SubsonicError) and (
+            exc.code == SUBSONIC_AUTH_FAIL or exc.http_status in (401, 403)
+        ):
+            LOG.error("Authentication failed for user %r at %s. Check --user/--password.", args.user, args.url)
+        elif isinstance(exc, SubsonicError) and exc.http_status in RETRYABLE_HTTP_STATUS:
+            LOG.error("Server is unavailable: %s", exc)
+        else:
+            LOG.error("Could not reach Navidrome: %s", exc)
+        return 2
+
+    if args.check:
+        LOG.info(
+            "Connection OK: Navidrome %s, Subsonic API %s at %s",
+            response.get("serverVersion", "unknown"),
+            response.get("version", "unknown"),
+            args.url,
+        )
+        return 0
+
     out_dir = Path(args.out).expanduser()
     if not args.dry_run:
         try:
@@ -2275,19 +2343,6 @@ def main(argv: Optional[list] = None) -> int:
         except OSError as exc:
             LOG.error("Cannot create output directory %s: %s", out_dir, exc)
             return 2
-
-    client = NavidromeClient(args.url, args.user, args.password, timeout=args.timeout, insecure=args.insecure)
-
-    try:
-        client.ping()
-    except SubsonicError as exc:
-        if exc.code == SUBSONIC_AUTH_FAIL or exc.http_status in (401, 403):
-            LOG.error("Authentication failed for user %r at %s. Check --user/--password.", args.user, args.url)
-        elif exc.http_status in RETRYABLE_HTTP_STATUS:
-            LOG.error("Server is unavailable: %s", exc)
-        else:
-            LOG.error("Could not reach Navidrome: %s", exc)
-        return 2
 
     try:
         selection = resolve_scope(client, args)
